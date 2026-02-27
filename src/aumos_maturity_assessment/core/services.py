@@ -22,11 +22,13 @@ from aumos_common.observability import get_logger
 from aumos_maturity_assessment.core.interfaces import (
     IAssessmentRepository,
     IAssessmentResponseRepository,
+    IBenchmarkComparator,
     IBenchmarkRepository,
     IPilotRepository,
     IReportGeneratorAdapter,
     IReportRepository,
     IRoadmapGeneratorAdapter,
+    IRoadmapPlanner,
     IRoadmapRepository,
     IScoringEngine,
 )
@@ -1393,3 +1395,277 @@ def _compute_percentile(
     if value >= p25:
         return 25
     return 10
+
+
+class BenchmarkComparisonService:
+    """Provide peer benchmarking, percentile rankings, and gap analysis.
+
+    Wraps IBenchmarkComparator to deliver structured comparison outputs
+    suitable for executive reporting and roadmap prioritisation.
+    """
+
+    def __init__(
+        self,
+        benchmark_comparator: IBenchmarkComparator,
+        benchmark_repo: IBenchmarkRepository,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            benchmark_comparator: Peer comparison and percentile ranking adapter.
+            benchmark_repo: Benchmark repository for retrieving industry data.
+            event_publisher: Kafka event publisher.
+        """
+        self._comparator = benchmark_comparator
+        self._benchmarks = benchmark_repo
+        self._publisher = event_publisher
+
+    async def run_peer_comparison(
+        self,
+        tenant_id: uuid.UUID,
+        assessment: Any,
+        industry: str,
+        organization_size: str,
+    ) -> dict[str, Any]:
+        """Run a full peer comparison for a completed assessment.
+
+        Retrieves the active industry benchmark, computes percentile rankings,
+        gap analysis vs best-in-class, and improvement priority scores.
+
+        Args:
+            tenant_id: Requesting tenant UUID.
+            assessment: Completed Assessment with dimension scores.
+            industry: Organisation industry vertical.
+            organization_size: Organisation size band.
+
+        Returns:
+            Dict with peer_group, percentile_rankings, gap_analysis,
+            improvement_priorities, and visualization_data.
+
+        Raises:
+            NotFoundError: If no benchmark is available for the industry/size.
+        """
+        benchmark = await self._benchmarks.get_active_benchmark(
+            tenant_id=tenant_id,
+            industry=industry,
+            organization_size=organization_size,
+        )
+
+        all_benchmarks = await self._benchmarks.list_by_industry(tenant_id, industry)
+
+        peer_group = await self._comparator.select_peer_group(
+            industry=industry,
+            organization_size=organization_size,
+            available_benchmarks=all_benchmarks,
+        )
+
+        if benchmark is None:
+            if not all_benchmarks:
+                raise NotFoundError(
+                    message=f"No benchmark data available for industry '{industry}'.",
+                    error_code=ErrorCode.NOT_FOUND,
+                )
+            benchmark = all_benchmarks[0]
+
+        assessment_scores = {
+            "data": assessment.data_score or 0.0,
+            "process": assessment.process_score or 0.0,
+            "people": assessment.people_score or 0.0,
+            "technology": assessment.technology_score or 0.0,
+            "governance": assessment.governance_score or 0.0,
+        }
+
+        percentile_rankings = await self._comparator.compute_percentile_rankings(
+            assessment_scores=assessment_scores,
+            benchmark=benchmark,
+        )
+
+        gap_analysis = await self._comparator.analyze_gap_vs_best_in_class(
+            assessment_scores=assessment_scores,
+            benchmark=benchmark,
+        )
+
+        improvement_priorities = await self._comparator.score_improvement_priorities(
+            gap_analysis=gap_analysis,
+            dimension_weights=None,
+        )
+
+        visualization_data = await self._comparator.generate_comparison_visualization_data(
+            assessment_scores=assessment_scores,
+            benchmark=benchmark,
+            percentile_rankings=percentile_rankings,
+        )
+
+        result = {
+            "peer_group": peer_group,
+            "percentile_rankings": percentile_rankings,
+            "gap_analysis": gap_analysis,
+            "improvement_priorities": improvement_priorities,
+            "visualization_data": visualization_data,
+        }
+
+        logger.info(
+            "Peer benchmark comparison completed",
+            tenant_id=str(tenant_id),
+            assessment_id=str(assessment.id),
+            industry=industry,
+            organization_size=organization_size,
+            overall_percentile=percentile_rankings.get("overall_percentile", 0),
+        )
+
+        await self._publisher.publish(
+            Topics.MATURITY_ASSESSMENT,
+            {
+                "event_type": "maturity.benchmark_compared",
+                "tenant_id": str(tenant_id),
+                "assessment_id": str(assessment.id),
+                "industry": industry,
+                "overall_percentile": percentile_rankings.get("overall_percentile", 0),
+            },
+        )
+
+        return result
+
+
+class RoadmapPlanningService:
+    """Generate detailed improvement roadmaps with timelines and Gantt exports.
+
+    Orchestrates IRoadmapPlanner to produce comprehensive roadmap documents
+    from gap analysis data, with timeline generation and dependency tracking.
+    """
+
+    def __init__(
+        self,
+        roadmap_planner: IRoadmapPlanner,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            roadmap_planner: Advanced roadmap planning adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._planner = roadmap_planner
+        self._publisher = event_publisher
+
+    async def generate_detailed_roadmap(
+        self,
+        tenant_id: uuid.UUID,
+        assessment_id: uuid.UUID,
+        gap_analysis: dict[str, Any],
+        horizon_months: int = 12,
+        parallel_streams: int = 2,
+        team_capacity_hours_per_week: float = 40.0,
+        hourly_cost_usd: float = 150.0,
+        start_date: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Generate a full detailed roadmap with timeline and Gantt export.
+
+        Runs the complete planning pipeline: gap-to-action mapping, priority
+        sequencing, effort/impact estimation, timeline generation, milestone
+        definition, dependency identification, and dual format export.
+
+        Args:
+            tenant_id: Requesting tenant UUID.
+            assessment_id: Source assessment UUID for event metadata.
+            gap_analysis: Output from BenchmarkComparisonService.run_peer_comparison
+                (contains gap_analysis key with dimension_gaps list).
+            horizon_months: Planning horizon in months.
+            parallel_streams: Number of work streams for timeline scheduling.
+            team_capacity_hours_per_week: Available team hours per week.
+            hourly_cost_usd: Fully-loaded hourly team cost in USD.
+            start_date: Roadmap start date (defaults to now UTC).
+
+        Returns:
+            Dict with roadmap_json and gantt_data keys, plus summary metadata.
+        """
+        action_map = await self._planner.map_gaps_to_actions(
+            gap_analysis=gap_analysis,
+            horizon_months=horizon_months,
+        )
+
+        sequenced = await self._planner.sequence_by_priority(
+            actions=action_map["actions"],
+        )
+
+        enriched = await self._planner.estimate_effort_and_impact(
+            actions=sequenced["sequenced_actions"],
+            team_capacity_hours_per_week=team_capacity_hours_per_week,
+            hourly_cost_usd=hourly_cost_usd,
+        )
+
+        timeline = await self._planner.generate_timeline(
+            sequenced_actions=enriched["enriched_actions"],
+            start_date=start_date,
+            parallel_streams=parallel_streams,
+        )
+
+        milestones = await self._planner.define_milestones(
+            timeline_entries=timeline["timeline_entries"],
+            horizon_months=horizon_months,
+        )
+
+        dependencies = await self._planner.identify_dependencies(
+            actions=enriched["enriched_actions"],
+        )
+
+        metadata = {
+            "tenant_id": str(tenant_id),
+            "assessment_id": str(assessment_id),
+            "horizon_months": horizon_months,
+            "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+
+        roadmap_json = await self._planner.export_roadmap_json(
+            actions=enriched["enriched_actions"],
+            timeline=timeline,
+            milestones=milestones,
+            dependencies=dependencies,
+            metadata=metadata,
+        )
+
+        gantt_data = await self._planner.export_gantt_data(
+            timeline_entries=timeline["timeline_entries"],
+            milestones=milestones,
+            start_date=timeline.get("start_date", ""),
+        )
+
+        result = {
+            "roadmap_json": roadmap_json,
+            "gantt_data": gantt_data,
+            "summary": {
+                "total_actions": action_map["total_actions_count"],
+                "quick_wins": len(sequenced["quick_wins"]),
+                "strategic_initiatives": len(sequenced["strategic_initiatives"]),
+                "total_effort_weeks": enriched["total_effort_weeks"],
+                "total_cost_usd": enriched["total_cost_usd"],
+                "duration_weeks": timeline["duration_weeks"],
+                "milestone_count": milestones["total_milestone_count"],
+                "dependency_warnings": len(sequenced.get("dependency_warnings", [])),
+                "projected_end_date": timeline.get("projected_end_date", ""),
+            },
+        }
+
+        logger.info(
+            "Detailed roadmap generated",
+            tenant_id=str(tenant_id),
+            assessment_id=str(assessment_id),
+            total_actions=action_map["total_actions_count"],
+            duration_weeks=timeline["duration_weeks"],
+            horizon_months=horizon_months,
+        )
+
+        await self._publisher.publish(
+            Topics.MATURITY_ROADMAP,
+            {
+                "event_type": "maturity.detailed_roadmap_generated",
+                "tenant_id": str(tenant_id),
+                "assessment_id": str(assessment_id),
+                "total_actions": action_map["total_actions_count"],
+                "horizon_months": horizon_months,
+                "duration_weeks": timeline["duration_weeks"],
+            },
+        )
+
+        return result

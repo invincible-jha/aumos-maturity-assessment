@@ -478,3 +478,239 @@ class ILMBenchmarkRepository(Protocol):
             List of benchmark records, one per dimension.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Interfaces for domain-specific analytics adapters
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IBenchmarkComparator(Protocol):
+    """Interface for industry peer comparison and percentile ranking."""
+
+    async def select_peer_group(
+        self,
+        industry: str,
+        organization_size: str,
+        available_benchmarks: list[Any],
+    ) -> dict[str, Any]:
+        """Select the most appropriate peer benchmark group for comparison.
+
+        Args:
+            industry: Organisation industry vertical.
+            organization_size: Organisation size band (small | mid | enterprise).
+            available_benchmarks: List of available benchmark records.
+
+        Returns:
+            Dict with selected_benchmark, peer_group_label, and sample_size.
+        """
+        ...
+
+    async def compute_percentile_rankings(
+        self,
+        assessment_scores: dict[str, float],
+        benchmark: Any,
+    ) -> dict[str, Any]:
+        """Compute percentile ranking for each dimension against the peer group.
+
+        Args:
+            assessment_scores: Dict of dimension name to score (0–100).
+            benchmark: Benchmark record with p25/p50/p75/p90 quartile data.
+
+        Returns:
+            Dict with percentile_rankings (per dimension) and overall_percentile.
+        """
+        ...
+
+    async def analyze_gap_vs_best_in_class(
+        self,
+        assessment_scores: dict[str, float],
+        benchmark: Any,
+    ) -> dict[str, Any]:
+        """Compare assessment scores against best-in-class (p90) thresholds.
+
+        Args:
+            assessment_scores: Dict of dimension name to score (0–100).
+            benchmark: Benchmark record with p90 quartile data per dimension.
+
+        Returns:
+            Dict with overall_gap, dimension_gaps, and gap_severity_labels.
+        """
+        ...
+
+    async def score_improvement_priorities(
+        self,
+        gap_analysis: dict[str, Any],
+        dimension_weights: dict[str, float] | None,
+    ) -> dict[str, Any]:
+        """Score improvement priorities based on gap magnitude and difficulty.
+
+        Args:
+            gap_analysis: Output of analyze_gap_vs_best_in_class.
+            dimension_weights: Optional custom weights per dimension.
+
+        Returns:
+            Dict with prioritized_dimensions (ranked list) and quick_win_flags.
+        """
+        ...
+
+    async def generate_comparison_visualization_data(
+        self,
+        assessment_scores: dict[str, float],
+        benchmark: Any,
+        percentile_rankings: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Generate visualization-ready data for radar chart and bar charts.
+
+        Args:
+            assessment_scores: Dict of dimension name to score.
+            benchmark: Benchmark record with median and quartile data.
+            percentile_rankings: Output of compute_percentile_rankings.
+
+        Returns:
+            Dict with radar_chart_data, percentile_bar_data, and gap_waterfall_data.
+        """
+        ...
+
+
+@runtime_checkable
+class IRoadmapPlanner(Protocol):
+    """Interface for advanced roadmap planning with timeline and Gantt export."""
+
+    async def map_gaps_to_actions(
+        self,
+        gap_analysis: dict[str, Any],
+        horizon_months: int,
+    ) -> dict[str, Any]:
+        """Map dimension gaps to specific actionable initiatives.
+
+        Args:
+            gap_analysis: Gap analysis output with dimension_gaps list.
+            horizon_months: Planning horizon to constrain initiative selection.
+
+        Returns:
+            Dict with actions, total_actions_count, and dimensions_addressed.
+        """
+        ...
+
+    async def sequence_by_priority(
+        self,
+        actions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Sequence actions from quick wins through strategic initiatives.
+
+        Args:
+            actions: List of action dicts from map_gaps_to_actions.
+
+        Returns:
+            Dict with sequenced_actions, quick_wins, strategic_initiatives,
+            and dependency_warnings.
+        """
+        ...
+
+    async def estimate_effort_and_impact(
+        self,
+        actions: list[dict[str, Any]],
+        team_capacity_hours_per_week: float,
+        hourly_cost_usd: float,
+    ) -> dict[str, Any]:
+        """Compute effort and impact estimates for each action.
+
+        Args:
+            actions: List of sequenced action dicts.
+            team_capacity_hours_per_week: Available team hours per week.
+            hourly_cost_usd: Fully-loaded hourly cost in USD.
+
+        Returns:
+            Dict with enriched_actions, total_effort_weeks, total_cost_usd.
+        """
+        ...
+
+    async def generate_timeline(
+        self,
+        sequenced_actions: list[dict[str, Any]],
+        start_date: datetime | None,
+        parallel_streams: int,
+    ) -> dict[str, Any]:
+        """Assign start/end dates to each action.
+
+        Args:
+            sequenced_actions: Priority-ordered actions.
+            start_date: Roadmap kickoff date.
+            parallel_streams: Number of work streams.
+
+        Returns:
+            Dict with timeline_entries, start_date, and projected_end_date.
+        """
+        ...
+
+    async def define_milestones(
+        self,
+        timeline_entries: list[dict[str, Any]],
+        horizon_months: int,
+    ) -> dict[str, Any]:
+        """Define milestone checkpoints at regular intervals.
+
+        Args:
+            timeline_entries: Timeline data from generate_timeline.
+            horizon_months: Total roadmap horizon.
+
+        Returns:
+            Dict with milestones, phase_completions, and total_milestone_count.
+        """
+        ...
+
+    async def identify_dependencies(
+        self,
+        actions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Identify and document dependencies between actions.
+
+        Args:
+            actions: List of action dicts with id, dimension, and phase.
+
+        Returns:
+            Dict with dependencies, dependency_graph, and orphaned_actions.
+        """
+        ...
+
+    async def export_roadmap_json(
+        self,
+        actions: list[dict[str, Any]],
+        timeline: dict[str, Any],
+        milestones: dict[str, Any],
+        dependencies: dict[str, Any],
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Export the complete roadmap as a structured JSON document.
+
+        Args:
+            actions: Sequenced and enriched action list.
+            timeline: Timeline data from generate_timeline.
+            milestones: Milestone data from define_milestones.
+            dependencies: Dependency data from identify_dependencies.
+            metadata: Optional metadata dict.
+
+        Returns:
+            Complete roadmap JSON document dict.
+        """
+        ...
+
+    async def export_gantt_data(
+        self,
+        timeline_entries: list[dict[str, Any]],
+        milestones: dict[str, Any],
+        start_date: str,
+    ) -> dict[str, Any]:
+        """Export roadmap data in Gantt chart format.
+
+        Args:
+            timeline_entries: Timeline data from generate_timeline.
+            milestones: Milestone data from define_milestones.
+            start_date: Roadmap start date string (YYYY-MM-DD).
+
+        Returns:
+            Dict with tasks, milestones_gantt, and chart_config.
+        """
+        ...
