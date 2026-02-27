@@ -2,6 +2,10 @@
 
 All services depend on these interfaces, not concrete implementations.
 This enables dependency injection and makes services independently testable.
+
+The ``ILM*`` interfaces describe the repositories consumed by AssessmentService
+(the lead-magnet anonymous assessment flow). Concrete implementations live in
+``adapters/repositories/assessment_repository.py``.
 """
 
 import uuid
@@ -334,5 +338,143 @@ class IReportGeneratorAdapter(Protocol):
 
         Returns:
             Dict with content and optional artifact_url.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Lead-magnet (anonymous self-service) repository interfaces
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ILMResponseRepository(Protocol):
+    """Repository interface for LMAssessmentResponse persistence.
+
+    Consumed by AssessmentService to store and retrieve individual
+    question answers grouped by anonymous assessment session.
+    """
+
+    async def create_response(
+        self,
+        session_id: uuid.UUID,
+        question_id: str,
+        answer_value: int,
+        industry_vertical: str,
+        answered_at: datetime,
+    ) -> Any:
+        """Persist a single question answer.
+
+        Args:
+            session_id: Assessment session UUID.
+            question_id: Question identifier from the question bank.
+            answer_value: Likert answer 1-5.
+            industry_vertical: Respondent's industry vertical.
+            answered_at: Timestamp when the answer was submitted.
+
+        Returns:
+            The persisted response record.
+        """
+        ...
+
+    async def get_responses_by_session(
+        self,
+        session_id: uuid.UUID,
+    ) -> list[Any]:
+        """Retrieve all answers for an assessment session.
+
+        Args:
+            session_id: Assessment session UUID.
+
+        Returns:
+            List of response records ordered by answered_at.
+        """
+        ...
+
+    async def count_responses_by_session(
+        self,
+        session_id: uuid.UUID,
+    ) -> int:
+        """Count the number of answers submitted for a session.
+
+        Args:
+            session_id: Assessment session UUID.
+
+        Returns:
+            Number of answer records for this session.
+        """
+        ...
+
+
+@runtime_checkable
+class ILMResultRepository(Protocol):
+    """Repository interface for LMAssessmentResult persistence.
+
+    Consumed by AssessmentService to store and retrieve finalised
+    assessment results including scores and CRM sync status.
+    """
+
+    async def create_result(
+        self,
+        session_id: uuid.UUID,
+        email: str,
+        company_name: str,
+        overall_score: float,
+        dimension_scores: dict[str, float],
+        maturity_level: int,
+        industry_vertical: str,
+        peer_percentile: float,
+    ) -> Any:
+        """Persist a completed assessment result.
+
+        Args:
+            session_id: Assessment session UUID.
+            email: Contact email for lead capture.
+            company_name: Organisation name.
+            overall_score: Composite score 0-100.
+            dimension_scores: Per-dimension scores dict.
+            maturity_level: Maturity level 1-5.
+            industry_vertical: Respondent's industry vertical.
+            peer_percentile: Estimated peer percentile 0-100.
+
+        Returns:
+            The persisted result record.
+        """
+        ...
+
+    async def get_result_by_session(
+        self,
+        session_id: uuid.UUID,
+    ) -> Any | None:
+        """Retrieve the result for a given assessment session.
+
+        Args:
+            session_id: Assessment session UUID.
+
+        Returns:
+            Result record or None if not yet completed.
+        """
+        ...
+
+
+@runtime_checkable
+class ILMBenchmarkRepository(Protocol):
+    """Repository interface for LMAssessmentBenchmark persistence.
+
+    Consumed by AssessmentService to retrieve industry benchmark
+    percentile data used for peer comparison in assessment results.
+    """
+
+    async def get_benchmarks_by_industry(
+        self,
+        industry_vertical: str,
+    ) -> list[Any]:
+        """Retrieve all benchmark records for an industry vertical.
+
+        Args:
+            industry_vertical: Industry vertical to query.
+
+        Returns:
+            List of benchmark records, one per dimension.
         """
         ...

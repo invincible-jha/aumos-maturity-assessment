@@ -40,4 +40,10 @@ class Settings(AumOSSettings):
     report_max_pages: int = 50
     report_include_benchmarks: bool = True
 
+    # AI Readiness Assessment lead magnet (self-service, no auth)
+    hubspot_api_key: str = ""
+    assessment_benchmark_refresh_days: int = 30
+    assessment_email_from: str = "assessments@aumos.ai"
+    enable_assessment_lead_capture: bool = True
+
     model_config = SettingsConfigDict(env_prefix="AUMOS_MATURITY_")

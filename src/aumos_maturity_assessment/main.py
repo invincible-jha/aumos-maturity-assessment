@@ -9,6 +9,7 @@ from aumos_common.app import create_app
 from aumos_common.database import init_database
 
 from aumos_maturity_assessment.api.router import router
+from aumos_maturity_assessment.api.routes.assessment import router as assessment_router
 from aumos_maturity_assessment.settings import Settings
 
 settings = Settings()
@@ -46,3 +47,4 @@ app: FastAPI = create_app(
 )
 
 app.include_router(router, prefix="/api/v1")
+app.include_router(assessment_router, prefix="/api/v1")
