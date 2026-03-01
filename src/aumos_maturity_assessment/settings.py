@@ -46,4 +46,30 @@ class Settings(AumOSSettings):
     assessment_email_from: str = "assessments@aumos.ai"
     enable_assessment_lead_capture: bool = True
 
+    # GAP-286: Configurable dimension system
+    default_dimensions: list[str] = [
+        "data",
+        "process",
+        "people",
+        "technology",
+        "governance",
+    ]
+    max_assessment_dimensions: int = 7
+
+    # GAP-287: Benchmark enrichment
+    benchmark_min_contribution_tenants: int = 30
+    benchmark_confidence_tier_thresholds: dict = {
+        "seed_estimate": 0,
+        "preliminary": 30,
+        "reliable": 100,
+        "robust": 500,
+    }
+
+    # GAP-289: Change management integration
+    change_mgmt_trigger_threshold: float = 50.0
+    change_mgmt_integration_enabled: bool = True
+
+    # GAP-291: Assessment progress
+    progress_lookback_assessments: int = 5
+
     model_config = SettingsConfigDict(env_prefix="AUMOS_MATURITY_")

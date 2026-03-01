@@ -4,19 +4,22 @@ All tables use the `mat_` prefix. Tenant-scoped tables extend AumOSModel
 which supplies id (UUID), tenant_id, created_at, and updated_at columns.
 
 Domain model:
-  Assessment         — maturity assessment instance with multi-dimensional scores
-  AssessmentResponse — individual question responses within an assessment
-  Benchmark          — industry benchmark data for comparison
-  Roadmap            — auto-generated AI adoption roadmap from assessment results
-  Pilot              — pilot design and execution tracking
-  Report             — generated executive report artifacts
+  Assessment                      — maturity assessment instance with multi-dimensional scores
+  AssessmentResponse              — individual question responses within an assessment
+  Benchmark                       — industry benchmark data for comparison
+  Roadmap                         — auto-generated AI adoption roadmap from assessment results
+  Pilot                           — pilot design and execution tracking
+  Report                          — generated executive report artifacts
+  MatDimensionConfig              — configurable assessment dimensions (GAP-286)
+  MatBenchmarkContributionConsent — opt-in consent for anonymous benchmark contribution (GAP-287)
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -28,7 +31,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from aumos_common.database import AumOSModel
+from aumos_common.database import AumOSModel, Base
 
 
 class Assessment(AumOSModel):
@@ -140,6 +143,15 @@ class Assessment(AumOSModel):
         UUID(as_uuid=True),
         nullable=True,
         comment="User ID who initiated this assessment",
+    )
+    dimensions_used: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: ["data", "process", "people", "technology", "governance"],
+        comment=(
+            "Ordered list of dimension IDs included in this assessment. "
+            "Defaults to the original 5 dimensions for backward compatibility."
+        ),
     )
 
     responses: Mapped[list["AssessmentResponse"]] = relationship(
@@ -314,6 +326,33 @@ class Benchmark(AumOSModel):
         nullable=False,
         default=True,
         comment="False when superseded by a newer benchmark period",
+    )
+    # GAP-287: Benchmark data enrichment fields
+    data_source: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default="seed_estimate",
+        comment="Source attribution, e.g. 'Gartner 2025 AI Adoption Survey (n=843)'",
+    )
+    confidence_tier: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="seed_estimate",
+        comment=(
+            "Data quality tier: seed_estimate (n<30) | preliminary (30-100) | "
+            "reliable (100-500) | robust (>500)"
+        ),
+    )
+    data_collected_at: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+        comment="Date when the underlying survey/research data was collected",
+    )
+    contributing_tenant_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Number of opt-in tenants contributing to this benchmark period",
     )
 
 
@@ -586,4 +625,119 @@ class Report(AumOSModel):
     assessment: Mapped["Assessment"] = relationship(
         "Assessment",
         back_populates="reports",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GAP-286: Configurable dimension system
+# ---------------------------------------------------------------------------
+
+
+class MatDimensionConfig(Base):
+    """Configurable assessment dimensions stored in the database.
+
+    Platform-wide configuration record (not tenant-scoped). Dimensions
+    are stored here rather than hardcoded so new dimensions can be added
+    via migration without code changes.
+
+    This class does NOT extend AumOSModel because dimension configs are
+    platform-wide, not tenant-scoped.
+
+    Table: mat_dimension_configs
+    """
+
+    __tablename__ = "mat_dimension_configs"
+
+    id: Mapped[str] = mapped_column(
+        String(100),
+        primary_key=True,
+        comment="Dimension slug, e.g. 'data', 'process', 'agentic_ai'",
+    )
+    display_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="Human-readable dimension name",
+    )
+    description: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="What this dimension measures",
+    )
+    default_weight: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        comment="Default weighting factor when this dimension is included",
+    )
+    question_bank: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        comment=(
+            "Diagnostic questions: "
+            "[{id, text, scoring_guidance}]"
+        ),
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="False = dimension is archived and not offered in new assessments",
+    )
+    introduced_in_version: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        comment="Platform version when this dimension was first available",
+    )
+    framework_alignment: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Industry framework this dimension aligns to, if any",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GAP-287: Opt-in benchmark contribution consent
+# ---------------------------------------------------------------------------
+
+
+class MatBenchmarkContributionConsent(AumOSModel):
+    """Opt-in consent for anonymous benchmark data contribution.
+
+    When a tenant consents, their anonymized assessment scores are
+    included in quarterly benchmark enrichment aggregations.
+
+    Minimum 30 consenting tenants are required before any benchmark
+    segment is updated to protect tenant privacy.
+
+    Table: mat_benchmark_contribution_consents
+    """
+
+    __tablename__ = "mat_benchmark_contribution_consents"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            name="uq_mat_benchmark_consent_tenant",
+        ),
+    )
+
+    consented: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="True when the tenant has opted in to anonymous data contribution",
+    )
+    consented_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp when consent was most recently granted",
+    )
+    consent_version: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="Consent policy version at time of agreement (for audit trail)",
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp when consent was revoked, if applicable",
     )

@@ -714,3 +714,126 @@ class IRoadmapPlanner(Protocol):
             Dict with tasks, milestones_gantt, and chart_config.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# GAP-286: Configurable dimension system interfaces
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IDimensionConfigRepository(Protocol):
+    """Repository interface for MatDimensionConfig persistence."""
+
+    async def get_by_id(
+        self,
+        dimension_id: str,
+    ) -> Any | None:
+        """Retrieve a dimension config by ID."""
+        ...
+
+    async def list_active(self) -> list[Any]:
+        """List all active dimension configs ordered by default_weight descending."""
+        ...
+
+    async def create(
+        self,
+        id: str,
+        display_name: str,
+        description: str,
+        default_weight: float,
+        question_bank: list[dict[str, Any]],
+        introduced_in_version: str,
+        framework_alignment: str | None,
+    ) -> Any:
+        """Create a new dimension config."""
+        ...
+
+    async def update_active(
+        self,
+        dimension_id: str,
+        is_active: bool,
+    ) -> Any:
+        """Activate or deactivate a dimension."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# GAP-287: Benchmark data enrichment interfaces
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IBenchmarkContributionConsentRepository(Protocol):
+    """Repository interface for MatBenchmarkContributionConsent persistence."""
+
+    async def get_by_tenant(
+        self,
+        tenant_id: uuid.UUID,
+    ) -> Any | None:
+        """Retrieve consent record for a tenant."""
+        ...
+
+    async def upsert(
+        self,
+        tenant_id: uuid.UUID,
+        consented: bool,
+        consent_version: str,
+    ) -> Any:
+        """Create or update consent for a tenant."""
+        ...
+
+    async def count_consenting_tenants(self) -> int:
+        """Count the number of tenants who have opted in to benchmark contribution."""
+        ...
+
+
+@runtime_checkable
+class IBenchmarkEnrichmentAdapter(Protocol):
+    """Interface for the quarterly benchmark enrichment adapter."""
+
+    async def run_quarterly_enrichment(
+        self,
+        industry: str,
+        organization_size: str,
+        benchmark_period: str,
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Aggregate opt-in tenant scores into updated benchmark data.
+
+        Args:
+            industry: Industry vertical to enrich.
+            organization_size: Organization size segment.
+            benchmark_period: Target period string (e.g. '2025-Q1').
+            tenant_id: Platform admin tenant UUID for record creation.
+
+        Returns:
+            Dict with updated benchmark stats and contributing_tenant_count.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# GAP-291: Assessment progress over time interfaces
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IMaturityProgressRepository(Protocol):
+    """Repository interface for querying historical assessment scores."""
+
+    async def list_completed_by_tenant(
+        self,
+        tenant_id: uuid.UUID,
+        limit: int,
+    ) -> list[Any]:
+        """List completed assessments ordered by completed_at ascending.
+
+        Args:
+            tenant_id: Tenant UUID.
+            limit: Maximum number of assessments to return.
+
+        Returns:
+            List of completed Assessment records.
+        """
+        ...

@@ -9,6 +9,8 @@ Key invariants enforced by services:
 - Score immutability: completed assessments cannot be rescored.
 - Benchmark alignment: roadmaps always reference the active benchmark period.
 - Pilot success framing: every pilot must define ≥3 measurable success criteria.
+- Dimension configurability: dimension set is persisted per assessment (GAP-286).
+- Benchmark enrichment: minimum 30 consenting tenants before updating (GAP-287).
 """
 
 import uuid
@@ -23,7 +25,11 @@ from aumos_maturity_assessment.core.interfaces import (
     IAssessmentRepository,
     IAssessmentResponseRepository,
     IBenchmarkComparator,
+    IBenchmarkContributionConsentRepository,
+    IBenchmarkEnrichmentAdapter,
     IBenchmarkRepository,
+    IDimensionConfigRepository,
+    IMaturityProgressRepository,
     IPilotRepository,
     IReportGeneratorAdapter,
     IReportRepository,
@@ -36,6 +42,8 @@ from aumos_maturity_assessment.core.models import (
     Assessment,
     AssessmentResponse,
     Benchmark,
+    MatBenchmarkContributionConsent,
+    MatDimensionConfig,
     Pilot,
     Report,
     Roadmap,
@@ -1669,3 +1677,460 @@ class RoadmapPlanningService:
         )
 
         return result
+
+
+# ---------------------------------------------------------------------------
+# GAP-286: Configurable dimension management service
+# ---------------------------------------------------------------------------
+
+
+class DimensionConfigService:
+    """Manages the configurable dimension registry for maturity assessments.
+
+    Dimensions are stored in mat_dimension_configs rather than hardcoded.
+    This service provides CRUD operations and the rebalancing logic used
+    when creating assessments with a custom dimension set.
+
+    Args:
+        dimension_repo: Repository for MatDimensionConfig persistence.
+    """
+
+    def __init__(
+        self,
+        dimension_repo: IDimensionConfigRepository,
+    ) -> None:
+        self._dimension_repo = dimension_repo
+
+    async def list_active_dimensions(self) -> list[Any]:
+        """Return all active dimensions ordered by default_weight descending.
+
+        Returns:
+            List of MatDimensionConfig records.
+        """
+        return await self._dimension_repo.list_active()
+
+    async def get_dimension(self, dimension_id: str) -> Any:
+        """Retrieve a single dimension config by ID.
+
+        Args:
+            dimension_id: Dimension slug (e.g. 'agentic_ai').
+
+        Returns:
+            MatDimensionConfig record.
+
+        Raises:
+            NotFoundError: If dimension does not exist.
+        """
+        config = await self._dimension_repo.get_by_id(dimension_id)
+        if config is None:
+            raise NotFoundError(
+                resource="MatDimensionConfig",
+                resource_id=dimension_id,
+                error_code=ErrorCode.RESOURCE_NOT_FOUND,
+            )
+        return config
+
+    async def resolve_dimension_weights(
+        self,
+        include_dimensions: list[str] | None,
+        custom_weights: dict[str, float] | None,
+    ) -> dict[str, float]:
+        """Resolve the final set of dimension weights for a new assessment.
+
+        If include_dimensions is None, uses all active dimensions.
+        If custom_weights are provided, validates they sum to 1.0.
+        Otherwise applies proportional auto-rebalancing.
+
+        Args:
+            include_dimensions: Optional list of dimension IDs to include.
+            custom_weights: Optional explicit weight mapping.
+
+        Returns:
+            Dict mapping dimension ID to weight (sum == 1.0).
+
+        Raises:
+            ValueError: If custom_weights do not sum to 1.0 (±0.001).
+            NotFoundError: If an include_dimensions entry is not found.
+        """
+        if custom_weights is not None:
+            total = sum(custom_weights.values())
+            if abs(total - 1.0) > 0.001:
+                raise ValueError(
+                    f"Custom dimension weights must sum to 1.0, got {total:.4f}"
+                )
+            return custom_weights
+
+        active_dims = await self._dimension_repo.list_active()
+        if include_dimensions is None:
+            dims = active_dims
+        else:
+            dim_map = {d.id: d for d in active_dims}
+            dims = []
+            for dim_id in include_dimensions:
+                if dim_id not in dim_map:
+                    raise NotFoundError(
+                        resource="MatDimensionConfig",
+                        resource_id=dim_id,
+                        error_code=ErrorCode.RESOURCE_NOT_FOUND,
+                    )
+                dims.append(dim_map[dim_id])
+
+        raw = {d.id: d.default_weight for d in dims}
+        total = sum(raw.values())
+        if total == 0:
+            raise ValueError("Cannot resolve weights: no dimensions selected")
+        return {dim_id: round(w / total, 4) for dim_id, w in raw.items()}
+
+
+# ---------------------------------------------------------------------------
+# GAP-287: Benchmark enrichment service
+# ---------------------------------------------------------------------------
+
+
+# Minimum consenting tenants required for a benchmark update
+_MIN_BENCHMARK_CONTRIBUTION_TENANTS: int = 30
+
+
+class BenchmarkEnrichmentService:
+    """Manages opt-in benchmark contribution consent and quarterly enrichment.
+
+    Benchmark segments are updated only when at least 30 tenants have
+    opted in, protecting individual tenant privacy through k-anonymity.
+
+    Args:
+        consent_repo: Repository for consent record persistence.
+        enrichment_adapter: Adapter that aggregates opt-in assessment data.
+        benchmark_repo: Repository for benchmark record updates.
+        publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        consent_repo: IBenchmarkContributionConsentRepository,
+        enrichment_adapter: IBenchmarkEnrichmentAdapter,
+        benchmark_repo: IBenchmarkRepository,
+        publisher: EventPublisher,
+    ) -> None:
+        self._consent_repo = consent_repo
+        self._enrichment_adapter = enrichment_adapter
+        self._benchmark_repo = benchmark_repo
+        self._publisher = publisher
+
+    async def set_contribution_consent(
+        self,
+        tenant_id: uuid.UUID,
+        consented: bool,
+        consent_version: str,
+    ) -> Any:
+        """Grant or revoke benchmark contribution consent for a tenant.
+
+        Args:
+            tenant_id: Tenant UUID.
+            consented: True to opt in, False to revoke.
+            consent_version: Policy version being accepted/revoked.
+
+        Returns:
+            Updated MatBenchmarkContributionConsent record.
+        """
+        record = await self._consent_repo.upsert(
+            tenant_id=tenant_id,
+            consented=consented,
+            consent_version=consent_version,
+        )
+        logger.info(
+            "benchmark_contribution_consent_updated",
+            tenant_id=str(tenant_id),
+            consented=consented,
+            consent_version=consent_version,
+        )
+        return record
+
+    async def get_contribution_consent(
+        self,
+        tenant_id: uuid.UUID,
+    ) -> Any | None:
+        """Retrieve the current consent status for a tenant.
+
+        Args:
+            tenant_id: Tenant UUID.
+
+        Returns:
+            MatBenchmarkContributionConsent record or None.
+        """
+        return await self._consent_repo.get_by_tenant(tenant_id)
+
+    async def run_quarterly_enrichment(
+        self,
+        industry: str,
+        organization_size: str,
+        benchmark_period: str,
+        platform_tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Run quarterly benchmark enrichment for a specific segment.
+
+        Aborts with a status dict if fewer than 30 tenants have consented,
+        protecting individual tenant privacy.
+
+        Args:
+            industry: Industry vertical to enrich.
+            organization_size: Organization size segment to enrich.
+            benchmark_period: Target period string (e.g. '2025-Q1').
+            platform_tenant_id: Admin tenant UUID for the benchmark record.
+
+        Returns:
+            Dict with status, contributing_tenant_count, and updated benchmark.
+        """
+        consenting_count = await self._consent_repo.count_consenting_tenants()
+        if consenting_count < _MIN_BENCHMARK_CONTRIBUTION_TENANTS:
+            logger.info(
+                "benchmark_enrichment_skipped_insufficient_consent",
+                consenting_count=consenting_count,
+                minimum_required=_MIN_BENCHMARK_CONTRIBUTION_TENANTS,
+                industry=industry,
+                organization_size=organization_size,
+            )
+            return {
+                "status": "skipped",
+                "reason": (
+                    f"Insufficient consenting tenants: {consenting_count} "
+                    f"(minimum {_MIN_BENCHMARK_CONTRIBUTION_TENANTS} required)"
+                ),
+                "contributing_tenant_count": consenting_count,
+            }
+
+        enrichment_result = await self._enrichment_adapter.run_quarterly_enrichment(
+            industry=industry,
+            organization_size=organization_size,
+            benchmark_period=benchmark_period,
+            tenant_id=platform_tenant_id,
+        )
+
+        logger.info(
+            "benchmark_enrichment_completed",
+            industry=industry,
+            organization_size=organization_size,
+            benchmark_period=benchmark_period,
+            contributing_tenant_count=consenting_count,
+        )
+
+        await self._publisher.publish(
+            Topics.MATURITY_ASSESSMENT,
+            {
+                "event_type": "maturity.benchmark.enriched",
+                "industry": industry,
+                "organization_size": organization_size,
+                "benchmark_period": benchmark_period,
+                "contributing_tenant_count": consenting_count,
+            },
+        )
+
+        return {
+            "status": "completed",
+            "contributing_tenant_count": consenting_count,
+            "benchmark_period": benchmark_period,
+            "industry": industry,
+            "organization_size": organization_size,
+            **enrichment_result,
+        }
+
+
+# ---------------------------------------------------------------------------
+# GAP-291: Assessment comparison over time
+# ---------------------------------------------------------------------------
+
+
+class MaturityProgressService:
+    """Computes maturity progress across multiple historical assessments.
+
+    Provides time-series delta analysis and projects time to the next
+    maturity level based on the current improvement rate.
+
+    Args:
+        progress_repo: Repository for querying historical assessment scores.
+    """
+
+    def __init__(
+        self,
+        progress_repo: IMaturityProgressRepository,
+    ) -> None:
+        self._progress_repo = progress_repo
+
+    async def compute_progress(
+        self,
+        tenant_id: uuid.UUID,
+        current_assessment_id: uuid.UUID,
+        lookback_assessments: int = 5,
+    ) -> dict[str, Any]:
+        """Compare current assessment to historical assessments.
+
+        Returns per-dimension deltas, overall score trajectory, and
+        projected months to reach next maturity level (extrapolated from
+        current improvement rate). Requires at least 2 completed assessments.
+
+        Args:
+            tenant_id: Tenant UUID for scoping.
+            current_assessment_id: UUID of the reference (most recent) assessment.
+            lookback_assessments: How many historical assessments to include.
+
+        Returns:
+            Dict with dimension_deltas, overall_trajectory, and
+            projected_level_up_months.
+
+        Raises:
+            NotFoundError: If current_assessment_id not found for tenant.
+            ConflictError: If fewer than 2 completed assessments exist.
+        """
+        historical = await self._progress_repo.list_completed_by_tenant(
+            tenant_id=tenant_id,
+            limit=lookback_assessments + 1,
+        )
+
+        if not historical:
+            raise NotFoundError(
+                resource="Assessment",
+                resource_id=str(current_assessment_id),
+                error_code=ErrorCode.RESOURCE_NOT_FOUND,
+            )
+
+        current = next(
+            (a for a in historical if str(a.id) == str(current_assessment_id)),
+            None,
+        )
+        if current is None:
+            raise NotFoundError(
+                resource="Assessment",
+                resource_id=str(current_assessment_id),
+                error_code=ErrorCode.RESOURCE_NOT_FOUND,
+            )
+
+        prior = [a for a in historical if str(a.id) != str(current_assessment_id)]
+
+        if not prior:
+            raise ConflictError(
+                message="Need at least 2 completed assessments for progress comparison",
+                error_code=ErrorCode.CONFLICT,
+            )
+
+        # Compute per-dimension deltas versus most recent prior assessment
+        most_recent_prior = prior[-1]
+        dimension_deltas = self._compute_dimension_deltas(current, most_recent_prior)
+
+        # Overall trajectory across all historical assessments
+        overall_trajectory = self._compute_trajectory(
+            [a for a in historical if a.overall_score is not None]
+        )
+
+        # Project months to next maturity level
+        projected_level_up_months = self._project_level_up(current, prior)
+
+        logger.info(
+            "maturity_progress_computed",
+            tenant_id=str(tenant_id),
+            current_assessment_id=str(current_assessment_id),
+            historical_count=len(prior),
+            current_level=current.maturity_level,
+            projected_level_up_months=projected_level_up_months,
+        )
+
+        return {
+            "current_assessment_id": str(current_assessment_id),
+            "current_overall_score": current.overall_score,
+            "current_maturity_level": current.maturity_level,
+            "dimension_deltas": dimension_deltas,
+            "overall_trajectory": overall_trajectory,
+            "projected_level_up_months": projected_level_up_months,
+            "historical_count": len(prior),
+        }
+
+    def _compute_dimension_deltas(
+        self,
+        current: Any,
+        prior: Any,
+    ) -> dict[str, float]:
+        """Compute score change per dimension from prior to current assessment.
+
+        Args:
+            current: Current (most recent) Assessment record.
+            prior: Prior Assessment record to compare against.
+
+        Returns:
+            Dict mapping dimension name to score delta (positive = improved).
+        """
+        dimensions = ["data", "process", "people", "technology", "governance"]
+        deltas: dict[str, float] = {}
+        for dim in dimensions:
+            current_score = getattr(current, f"{dim}_score", None)
+            prior_score = getattr(prior, f"{dim}_score", None)
+            if current_score is not None and prior_score is not None:
+                deltas[dim] = round(current_score - prior_score, 2)
+        return deltas
+
+    def _compute_trajectory(
+        self,
+        assessments: list[Any],
+    ) -> list[dict[str, Any]]:
+        """Build a time-series of overall scores across assessments.
+
+        Args:
+            assessments: List of Assessment records with overall_score and completed_at.
+
+        Returns:
+            List of dicts with assessment_id, completed_at, and overall_score.
+        """
+        return [
+            {
+                "assessment_id": str(a.id),
+                "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+                "overall_score": a.overall_score,
+                "maturity_level": a.maturity_level,
+            }
+            for a in assessments
+            if a.overall_score is not None
+        ]
+
+    def _project_level_up(
+        self,
+        current: Any,
+        historical: list[Any],
+    ) -> float | None:
+        """Project months until next maturity level based on improvement rate.
+
+        Uses linear extrapolation from the average monthly score improvement
+        rate across all historical assessments.
+
+        Args:
+            current: Current Assessment record.
+            historical: List of prior completed Assessment records (oldest first).
+
+        Returns:
+            Projected months to next level, or None if projection not possible.
+        """
+        if current.overall_score is None or current.maturity_level is None:
+            return None
+
+        if len(historical) < 1:
+            return None
+
+        oldest = historical[0]
+        if oldest.overall_score is None or oldest.completed_at is None:
+            return None
+        if current.completed_at is None:
+            return None
+
+        # Average monthly improvement rate
+        elapsed_months = max(
+            (current.completed_at - oldest.completed_at).days / 30.44, 0.1
+        )
+        total_improvement = current.overall_score - oldest.overall_score
+        monthly_rate = total_improvement / elapsed_months
+
+        if monthly_rate <= 0:
+            return None
+
+        # Score threshold for next level (each level = 20 points on 0-100 scale)
+        next_level_threshold = current.maturity_level * 20.0
+        if current.overall_score >= next_level_threshold:
+            return 0.0
+
+        points_needed = next_level_threshold - current.overall_score
+        return round(points_needed / monthly_rate, 1)
